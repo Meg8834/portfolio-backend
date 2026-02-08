@@ -1,6 +1,7 @@
 import os
 import sqlite3
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -11,6 +12,7 @@ CORS(app)
 db = None
 cursor = None
 db_backend = None
+db_error = None
 
 
 def normalize_postgres_url(url):
@@ -47,7 +49,17 @@ if postgres_url:
     try:
         import psycopg2
 
-        db = psycopg2.connect(postgres_url, sslmode=os.environ.get("PGSSLMODE", "require"))
+        connect_kwargs = {}
+        parsed_url = urlparse(postgres_url)
+        pg_sslmode = os.environ.get("PGSSLMODE")
+        if pg_sslmode:
+            connect_kwargs["sslmode"] = pg_sslmode
+        elif parsed_url.hostname and parsed_url.hostname.endswith(".internal"):
+            connect_kwargs["sslmode"] = "disable"
+        else:
+            connect_kwargs["sslmode"] = "require"
+
+        db = psycopg2.connect(postgres_url, **connect_kwargs)
         cursor = db.cursor()
         cursor.execute(
             """
@@ -64,8 +76,10 @@ if postgres_url:
         db.commit()
         db_backend = "postgres"
     except ImportError:
+        db_error = "psycopg2_not_installed"
         print("Warning: psycopg2 not installed. Falling back to MySQL/SQLite.")
     except Exception as e:
+        db_error = f"postgres_connect_failed: {type(e).__name__}: {e}"
         print("Warning: Could not connect to PostgreSQL. Falling back to MySQL/SQLite:", e)
 
 if not cursor:
@@ -81,8 +95,12 @@ if not cursor:
         cursor = db.cursor()
         db_backend = "mysql"
     except ImportError:
+        if not db_error:
+            db_error = "mysql_connector_not_installed"
         print("Warning: mysql.connector not installed. Falling back to SQLite.")
     except Exception as e:
+        if not db_error:
+            db_error = f"mysql_connect_failed: {type(e).__name__}: {e}"
         print("Warning: Could not connect to MySQL database. Falling back to SQLite:", e)
 
 if not cursor:
@@ -92,7 +110,11 @@ if not cursor:
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "db_connected": bool(cursor), "backend": db_backend})
+    payload = {"status": "ok", "db_connected": bool(cursor), "backend": db_backend}
+    if db_error:
+        payload["db_error"] = db_error
+    payload["has_database_url"] = bool(postgres_url)
+    return jsonify(payload)
 
 
 @app.route("/contact", methods=["POST"])
